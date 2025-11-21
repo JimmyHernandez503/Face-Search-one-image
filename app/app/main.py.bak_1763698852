@@ -1,0 +1,183 @@
+import os
+from pathlib import Path
+from typing import List, Dict, Optional
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
+
+from .embeddings import best_face_embedding, best_face_embedding_tta
+
+# -----------------------
+# Configuración por entorno
+# -----------------------
+
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+COLLECTION = os.getenv("COLLECTION_NAME", "faces")
+THUMBS_DIR = os.getenv("THUMBS_DIR", "/data/thumbs")
+
+# Top-K y parámetros de búsqueda
+TOP_K = int(os.getenv("TOP_K", "10"))
+
+# Umbral mínimo de similitud (COSINE, 0–1). Debajo de esto se considera "desconocido".
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.40"))
+
+# ef en búsqueda HNSW (trade-off recall/velocidad)
+HNSW_EF = int(os.getenv("HNSW_EF", "256"))
+
+# Activar o no TTA en las búsquedas
+USE_TTA = os.getenv("TTA_SEARCH", "1") == "1"
+
+# -----------------------
+# App, estáticos y plantillas
+# -----------------------
+
+app = FastAPI(title="oceano4 - Reconocimiento facial")
+
+# Aseguramos que exista el directorio de thumbs
+Path(THUMBS_DIR).mkdir(parents=True, exist_ok=True)
+
+STATIC_DIR = Path(__file__).parent / "static"
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/thumbs", StaticFiles(directory=THUMBS_DIR), name="thumbs")
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+# Cliente Qdrant global
+_client = QdrantClient(url=QDRANT_URL, timeout=600)
+
+
+# -----------------------
+# Endpoints
+# -----------------------
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/status")
+def status():
+    try:
+        c = _client.get_collection(COLLECTION)
+        count = _client.count(COLLECTION, exact=False).count
+        return {"collection": COLLECTION, "vectors": count, "status": c.status.value}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "items": [],
+            "error": None,
+        },
+    )
+
+
+@app.post("/search", response_class=HTMLResponse)
+async def search(request: Request, file: UploadFile = File(...)):
+    # Leer bytes y decodificar con OpenCV
+    data = await file.read()
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return templates.TemplateResponse(
+            "index.html",
+            {
+                "request": request,
+                "items": [],
+                "error": "No se pudo decodificar la imagen.",
+            },
+        )
+
+    # Embedding de la consulta (con o sin TTA)
+    if USE_TTA:
+        out = best_face_embedding_tta(img)
+    else:
+        out = best_face_embedding(img)
+
+    if out is None:
+        return templates.TemplateResponse(
+            "index.html",
+            {
+                "request": request,
+                "items": [],
+                "error": "No se detectó rostro en la imagen cargada.",
+            },
+        )
+
+    emb, _bbox = out
+
+    # -----------------------
+    # Búsqueda en Qdrant
+    # -----------------------
+    try:
+        res = _client.search(
+            collection_name=COLLECTION,
+            query_vector=emb.tolist(),
+            limit=TOP_K,
+            with_payload=["dui", "path", "thumb_id"],
+            search_params=qmodels.SearchParams(
+                hnsw_ef=HNSW_EF,
+                exact=False,
+            ),
+        )
+    except Exception as e:
+        return templates.TemplateResponse(
+            "index.html",
+            {
+                "request": request,
+                "items": [],
+                "error": f"Error consultando Qdrant: {e}",
+            },
+        )
+
+    items: List[Dict] = []
+    for p in res:
+        score = float(p.score)  # En COSINE, mayor = mejor (1.0 = idéntico)
+        if score < SIM_THRESHOLD:
+            # Ignoramos resultados por debajo del umbral: los consideramos "desconocidos"
+            continue
+
+        pid = str(p.id)  # UUID
+        payload = p.payload or {}
+        dui = payload.get("dui", "")
+        path = payload.get("path", "")
+        thumb_id = payload.get("thumb_id", pid)  # fallback al id si viniera vacío
+
+        percent = round(score * 100.0, 2)
+        thumb_path = Path(THUMBS_DIR, f"{thumb_id}.jpg")
+        thumb: Optional[str] = None
+        if thumb_path.exists():
+            thumb = f"/thumbs/{thumb_id}.jpg"
+
+        items.append(
+            {
+                "percent": percent,
+                "dui": dui,
+                "path": path,
+                "pid": pid,
+                "thumb": thumb,
+            }
+        )
+
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "items": items,
+            "error": None,
+        },
+    )
+
