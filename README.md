@@ -1,355 +1,293 @@
-# face-search-qdrant-demo
+Oceano — Motor de búsqueda facial sobre Qdrant
 
-Demo **end-to-end** de búsqueda de rostros usando:
+Nombre en clave: oceano
 
-- **FastAPI** + HTML sencillo para subir una foto y buscar similares  
-- **InsightFace** (GPU, `onnxruntime-gpu`) para embeddings faciales (512-D)  
-- **Qdrant** como base de datos vectorial (cosine similarity)  
-- Ingesta incremental de millones de fotos con **SQLite** y thumbnails persistentes
+Oceano es un sistema de búsqueda y comparación de rostros a gran escala, pensado para trabajar con millones de personas a partir de una foto frontal por individuo (fondo blanco), utilizando:
 
-Internamente el proyecto se llama **“infierno” / “oceano4”**, pero está empaquetado como un demo genérico de búsqueda facial con Qdrant.
+FastAPI como backend y UI web sencilla.
 
----
+Qdrant como base de datos vectorial.
 
-## 1. Arquitectura
+InsightFace (buffalo_l) como modelo de embeddings faciales.
 
-Componentes principales:
+Docker para empaquetar y desplegar todo el entorno.
 
-- **Servicio API (`api`)**
-  - Imagen Docker basada en `nvidia/cuda:*` con Python, FastAPI y InsightFace.
-  - Endpoints:
-    - `GET /` → formulario HTML para subir foto.
-    - `POST /search` → recibe una imagen, extrae el embedding del mejor rostro y consulta Qdrant (top-10).
-    - `GET /healthz` → healthcheck rápido.
-    - `GET /status` → estado de la colección (nombre, número de vectores, status en Qdrant).
-  - Expone:
-    - **Puerto host 9000 → contenedor 7860**
+Este repositorio está preparado para subir a GitHub:
+no incluye modelos, datos, thumbnails ni índices, solo código y configuración.
 
-- **Qdrant (`qdrant`)**
-  - Contenedor oficial `qdrant/qdrant:v1.9.1`.
-  - Distancia: `cosine`, dimensión: **512**.
-  - Expone:
-    - **Puerto host 9001 → 6333 (HTTP)**
-    - **Puerto host 9002 → 6334 (gRPC)**
-  - Persiste datos en `./qdrant_storage`.
+Características principales
 
-- **Ingesta (`app.ingest`)**
-  - Script Python (`app/app/ingest.py`) que:
-    - Recorre recursivamente una carpeta de imágenes.
-    - Calcula embedding con InsightFace (`embed_path`).
-    - Crea/actualiza colección en Qdrant.
-    - Genera **thumbnails** persistentes en `THUMBS_DIR` (por defecto `./thumbs`).
-    - Lleva un registro en **SQLite**:
-      - Tabla `files(path, mtime, status, point_id, error)`.
-      - Permite **resume** automático (solo procesa cambios nuevos).
+🔍 Búsqueda facial top-K (por defecto, top-10 resultados más parecidos).
 
-- **Embeddings (`app.embeddings`)**
-  - Usa `insightface.app.FaceAnalysis` con:
-    - Modelo configurable: `MODEL_NAME` (por defecto `buffalo_s`).
-    - Carpeta de modelos: `INSIGHTFACE_MODELS` (por defecto `/models`).
-    - `MAX_SIDE` / `DOWNSCALE_TO` para limitar tamaño de entrada.
-  - Selecciona el **rostro más grande** de la imagen como “mejor rostro”.
-  - Devuelve embedding normalizado (`512-D float32`) + bounding box.
+🧠 Modelo InsightFace buffalo_l (más preciso que buffalo_s).
 
-- **Front-end (templates)**
-  - `templates/index.html` + `static/style.css`.
-  - Interfaz minimalista oscuro:
-    - Formulario para subir foto.
-    - Tabla con resultados (`% similitud`, DUI, thumbnail, ruta de archivo, ID).
+🎛️ Test-Time Augmentation (TTA) en las consultas:
 
----
+imagen original
 
-## 2. Requisitos
+flip horizontal
 
-### Hardware / SO
+variaciones de brillo
 
-- Host Linux (probado en **Ubuntu 24.04.3 LTS**).
-- **GPU NVIDIA** con drivers correctos.
-- Al menos ~6 GB VRAM recomendados (ej. RTX 3060 6GB).
+rotación ligera ±15°
+Se promedian los embeddings para una consulta más robusta.
 
-### Software
+📦 Ingesta incremental:
 
-- **Docker** + **Docker Compose plugin**.
-- **NVIDIA Container Toolkit** (`nvidia-ctk`) para exponer la GPU al contenedor.
-- Conexión a Internet la primera vez (para descargar imágenes Docker y modelos).
+Recorre carpetas de imágenes.
 
----
+Genera embeddings en GPU/CPU.
 
-## 3. Estructura del repositorio
+Guarda estado en SQLite para reanudar.
 
-```text
-.
-├── app/
-│   ├── requirements.txt      # Dependencias Python del servicio API/ingesta
-│   └── app/
-│       ├── __init__.py
-│       ├── main.py           # FastAPI + endpoints + lógica de búsqueda
-│       ├── embeddings.py     # InsightFace, lectura de imágenes y embeddings
-│       ├── ingest.py         # Ingesta incremental + SQLite + thumbnails + Qdrant
-│       ├── static/
-│       │   └── style.css     # Estilos de la UI
-│       └── templates/
-│           └── index.html    # UI HTML (formulario + tabla de resultados)
-├── docker-compose.yml        # Orquestación API + Qdrant (GPU)
-├── Dockerfile                # Imagen API (CUDA + FastAPI + InsightFace)
-├── setup_infierno.sh         # Instalación “1 click” en Ubuntu con GPU
-├── ingest_folder.sh          # Ingesta de una carpeta del host dentro del contenedor
-├── ingest_stats.sh           # Estadísticas básicas de ingesta (SQLite)
-├── status.sh                 # Estado rápido de docker compose + /status
-├── backup_infierno.sh        # Backup completo (código + datos + checksums)
-├── make_portable_infierno.sh # Utilidades para versión portable
-└── export_github_zip.sh      # Genera ZIP solo con código/config (sin datos pesados)
-```
+Crea thumbnails por persona.
 
----
+⚙️ Qdrant / HNSW afinado para grandes volúmenes:
 
-## 4. Instalación rápida (Ubuntu + GPU)
+Distancia COSINE sobre vectores de 512 dimensiones.
 
-> **Advertencia:** `setup_infierno.sh` instala Docker, NVIDIA Container Toolkit, crea `docker-compose.yml` y `Dockerfile` en el directorio. Úsalo en un host dedicado o sabiendo lo que hace.
+Parámetros HNSW ajustables (m, ef_construct, hnsw_ef).
 
-```bash
-# Clonar repo
-git clone https://github.com/JimmyHernandez503/face-search-qdrant-demo.git
-cd face-search-qdrant-demo
+🌐 UI web sencilla:
 
-# Dar permisos a los scripts
-chmod +x setup_infierno.sh ingest_folder.sh ingest_stats.sh status.sh backup_infierno.sh
+Subes una foto.
 
-# Ejecutar instalación "1 click"
-./setup_infierno.sh
-```
+Devuelve lista de candidatos con:
 
-El script:
+% de similitud.
 
-1. Borra restos de instalaciones viejas de Docker (opcional).
-2. Instala **Docker CE oficial** (`get.docker.com`).
-3. Instala y configura **NVIDIA Container Toolkit** (`nvidia-ctk runtime configure`).
-4. Genera `docker-compose.yml` y `Dockerfile` (API + Qdrant).
-5. Hace `docker compose up -d` levantando:
-   - `infierno-qdrant` (Qdrant)
-   - `infierno-api` (FastAPI + InsightFace)
+DUI / ID (del nombre de archivo).
 
-Una vez termine:
+Ruta original.
 
-- API: <http://localhost:9000/>
-- Estado API/Qdrant: <http://localhost:9000/status>
+Thumbnail.
 
----
+Arquitectura
 
-## 5. Instalación manual (Docker Compose)
+app/app/main.py
+API FastAPI, endpoints:
 
-Si ya tienes Docker + NVIDIA Toolkit:
+GET / → formulario web.
 
-```bash
-git clone https://github.com/JimmyHernandez503/face-search-qdrant-demo.git
-cd face-search-qdrant-demo
+POST /search → búsqueda facial.
 
-# Revisa/ajusta docker-compose.yml y Dockerfile si lo necesitas
+GET /healthz → health-check.
+
+GET /status → estado de la colección en Qdrant.
+
+app/app/embeddings.py
+
+Inicializa el modelo InsightFace (buffalo_l por defecto).
+
+Lee y reescala imágenes.
+
+Obtiene el embedding del rostro más grande.
+
+Implementa best_face_embedding_tta (TTA ligero para consultas).
+
+app/app/ingest.py
+
+Ingesta masiva/incremental de imágenes.
+
+Crea thumbnails.
+
+Inserta vectores en Qdrant usando HNSW.
+
+Guarda estado en SQLite (ingestion.db).
+
+app/app/templates/index.html
+
+UI web para subir una foto y ver resultados.
+
+app/app/static/
+
+CSS y recursos estáticos.
+
+docker-compose.yml
+
+Servicio api: FastAPI + modelo InsightFace.
+
+Servicio qdrant: base vectorial.
+
+Monta volúmenes (models, thumbs, qdrant_storage, logs, state).
+
+Requisitos
+
+Sistema operativo: Linux recomendado (probado en Ubuntu 24.x).
+
+Docker y docker compose.
+
+Opcional (GPU):
+
+NVIDIA drivers instalados en el host.
+
+nvidia-container-toolkit configurado.
+
+La línea gpus: all en docker-compose.yml habilita el uso de la GPU.
+
+Sin GPU, el proyecto puede funcionar en CPU (más lento) ajustando el código para usar solo CPUExecutionProvider.
+
+Puesta en marcha rápida (instancia Oceano)
+
+Clona el repositorio:
+
+git clone https://github.com/TU_USUARIO/oceano.git
+cd oceano
+
+
+Crea directorios de trabajo (se pueden versionar o ignorar según tu flujo):
+
+mkdir -p models thumbs qdrant_storage logs state
+
+
+Levanta servicios (API + Qdrant):
 
 docker compose up -d --build
-```
 
-Puertos y volúmenes por defecto (`docker-compose.yml`):
 
-- **API**
-  - `9000:7860`
-  - Volúmenes:
-    - `./logs:/logs`
-    - `./state:/state` (SQLite)
-    - `./thumbs:/data/thumbs` (thumbnails)
-    - `./models:/models` (modelos InsightFace)
-    - `${HOME}:/hosthome` (home del host dentro del contenedor)
+Abre la UI:
 
-- **Qdrant**
-  - `9001:6333` (HTTP)
-  - `9002:6334` (gRPC)
-  - `./qdrant_storage:/qdrant/storage`
+Navegador → http://localhost:9100/
 
----
+La primera vez que busques, InsightFace descargará automáticamente el modelo en ./models.
 
-## 6. Ingesta de imágenes
+Ingesta de rostros
 
-> Sin ingesta **no habrá resultados**: primero llena la colección de Qdrant con tus fotos.
+La ingesta recorre una carpeta de fotos (por ejemplo, una foto frontal por persona) y:
 
-### 6.1. Asumiendo carpeta de fotos en el host
+Calcula el embedding con buffalo_l.
 
-La carpeta debe colgar de tu `$HOME`, por ejemplo:
+Inserta el vector en Qdrant.
 
-```bash
-/home/user2025/Documentos/fotos_personas/
-```
+Crea un thumbnail por cada foto.
 
-Ejemplo de uso:
+Guarda el estado en SQLite para poder reanudar.
 
-```bash
-# Desde la raíz del repo
-./ingest_folder.sh "/home/user2025/Documentos/fotos_personas"
-```
+Preparar el dataset
 
-El script:
+Una foto por persona (idealmente frontal, fondo neutro/blanco).
 
-1. Comprueba que `qdrant` está levantado (`docker compose up -d qdrant`).
-2. Mapea `$HOME` del host a `/hosthome` dentro del contenedor.
-3. Convierte la ruta del host a `/hosthome/...` (`CONTAINER_PATH`).
-4. Ejecuta dentro del servicio `api`:
+Nombres de archivo con el identificador de la persona, por ejemplo:
 
-   ```bash
-   python3 -m app.ingest --path /hosthome/Documentos/fotos_personas
-   ```
+02239037-4.jpg
 
-Puedes pasar opciones extra a `ingest.py`:
+06024583-0.jpg
 
-```bash
-# Forzar reprocesar todo (ignora SQLite)
-./ingest_folder.sh "/home/user2025/Documentos/fotos_personas" --no-resume
+Ese nombre se usará como campo dui en el payload de Qdrant.
 
-# Cambiar tamaño de batch
-./ingest_folder.sh "/home/user2025/Documentos/fotos_personas" --batch 512
-```
+Comando de ingesta (desde el host)
 
-### 6.2. Comportamiento de la ingesta
+Ejemplo: si tus fotos están en ~/Documentos/fotos_f:
 
-- Crea/usa una **BD SQLite** en `./state/ingestion.db`.
-- Por cada archivo:
-  - Verifica si es imagen (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`).
-  - Obtiene `dui` del nombre del archivo (todo antes del punto).
-  - Calcula embedding con InsightFace.
-  - Genera **UUID** como `point_id`.
-  - Inserta en Qdrant con payload, típicamente:
+cd /ruta/a/oceano
 
-    ```json
-    {
-      "dui": "01234567-8",
-      "path": "/hosthome/Documentos/fotos_personas/01234567-8.jpg",
-      "thumb_id": "e7ad0f96-....-....-....-........"
-    }
-    ```
+docker compose run --rm \
+  api \
+  python3 -m app.ingest \
+  --path "/hosthome/Documentos/fotos_f" \
+  --batch 256
 
-  - Crea thumbnail persistente en `THUMBS_DIR` (por defecto `/data/thumbs`).
 
-- Guarda en SQLite:
-  - `status = 'done' | 'pending' | 'error'`
-  - `error` con la excepción si algo falla (sin bloquear el resto).
+Notas:
 
-### 6.3. Ver estadísticas de ingesta
+El docker-compose.yml monta ${HOME} del host como /hosthome en el contenedor.
+Por eso la ruta dentro del contenedor es /hosthome/….
 
-```bash
-./ingest_stats.sh
-```
+--batch 256 controla cuántos puntos se envían por lote a Qdrant.
 
-Muestra con `sqlite3`:
+La ingesta es incremental: guarda el estado en state/ingestion.db.
+Si vuelves a lanzar el comando, solo procesará lo nuevo o lo modificado.
 
-- Número total de archivos.
-- Conteo por estado (`done`, `pending`, `error`).
+Uso de la interfaz web
 
----
+Abre http://localhost:9100/.
 
-## 7. Uso de la interfaz web
+Sube una foto con un rostro (idealmente frontal).
 
-Una vez API + Qdrant + ingesta están listos:
+El sistema:
 
-1. Abre en el navegador: **<http://localhost:9000/>**
-2. Verás un formulario:
+Detecta el rostro.
 
-   - “Sube una foto (rostro)”
-   - Botón **“Buscar top-10”**
+Aplica TTA y genera un embedding robusto.
 
-3. Sube una imagen con un rostro.
-4. El backend:
-   - Lee la imagen con OpenCV.
-   - Extrae el mejor rostro con InsightFace.
-   - Realiza un `search` en Qdrant:
-     - colección `COLLECTION_NAME` (por defecto `faces`).
-     - métrica `cosine`.
-     - `limit = 10`.
+Consulta Qdrant para obtener el top-K (por defecto, 10) más similares.
 
-5. La tabla de resultados muestra:
+La página muestra, por cada coincidencia:
 
-   - **Similitud (%)** → `score * 100`, donde `score` es `cosine similarity` (1.0 = 100%).
-   - **DUI** (si el nombre de archivo lo contenía).
-   - **Thumbnail** → recorte de rostro (si existe en `/thumbs`).
-   - **Ruta** → path completo al archivo original.
-   - **ID** (UUID de Qdrant).
+% de similitud (cosine similarity × 100).
 
-Si no se detecta ningún rostro, el template muestra un mensaje de error:  
-`"No se detectó rostro en la imagen cargada."`
+DUI/ID (extraído del nombre de archivo original).
 
----
+Ruta original.
 
-## 8. Variables de entorno importantes
+Thumbnail (si existe).
 
-### API (`app.main`)
+Variables de entorno clave
 
-- `QDRANT_URL`  
-  URL HTTP de Qdrant (por defecto `http://localhost:6333` o `http://qdrant:6333` en docker-compose).
+Definidas en docker-compose.yml (servicio api):
 
-- `COLLECTION_NAME`  
-  Nombre de la colección en Qdrant (`faces` por defecto).
+QDRANT_URL / QDRANT_GRPC_URL
+URLs internas para la instancia de Qdrant.
 
-- `THUMBS_DIR`  
-  Directorio de thumbnails (`/data/thumbs` por defecto, mapeado a `./thumbs` en el host).
+COLLECTION_NAME
+Nombre de la colección en Qdrant (por defecto faces).
 
-### Ingesta (`app.ingest`)
+THUMBS_DIR
+Directorio donde se guardan los thumbnails (montado como volumen).
 
-- `QDRANT_URL`  
-- `COLLECTION_NAME`
-- `SQLITE_DB` (por defecto `/state/ingestion.db`)
-- `THUMBS_DIR` (por defecto `/data/thumbs`)
-- `QUANTIZATION`  
-  - `"none"` (por defecto)  
-  - `"scalar"` → activa `ScalarQuantization` INT8 en Qdrant para ahorrar RAM.
+SQLITE_DB
+Ruta del archivo SQLite donde se guarda el estado de la ingesta.
 
-### Embeddings (`app.embeddings`)
+MODEL_NAME
+Modelo de InsightFace (buffalo_l por defecto).
 
-- `INSIGHTFACE_MODELS` → `/models` por defecto.
-- `MODEL_NAME` → `buffalo_s` por defecto.
-- `DET_SIZE` → `"512,512"` por defecto.
-- `MAX_SIDE` / `DOWNSCALE_TO` → control de tamaño máximo de la imagen.
+DET_SIZE
+Tamaño de entrada del detector de rostros (640,640 por defecto).
 
----
+MAX_SIDE, DOWNSCALE_TO
+Parámetros para reescalar imágenes muy grandes antes de pasar al modelo.
 
-## 9. Scripts auxiliares
+TOP_K
+Número de resultados a devolver en cada búsqueda (por defecto 10).
 
-- `setup_infierno.sh`  
-  Instalación completa en host Ubuntu (Docker + NVIDIA + docker-compose + Dockerfile).
+SIM_THRESHOLD
+Umbral de similitud mínima.
 
-- `ingest_folder.sh`  
-  Lanza ingesta de una carpeta del host desde fuera del contenedor.
+0.0 → no filtra nada, se muestran siempre los top-K.
 
-- `ingest_stats.sh`  
-  Muestra stats básicas de la BD de ingesta.
+Valores típicos para modo estricto: 0.40–0.50.
 
-- `status.sh`  
-  - `docker compose ps`
-  - `curl http://localhost:9000/status`
-  - Últimas 50 líneas de logs del servicio `api`.
+HNSW_EF
+Parámetro de búsqueda HNSW (trade-off entre velocidad y recall).
 
-- `backup_infierno.sh`  
-  Crea `backup/infierno_backup_YYYYMMDD_HHMMSS.tgz` con:
-  - Código del proyecto.
-  - `state/`, `thumbs/`, `qdrant_storage/`, etc.
-  - Fichero `checksums.*.sha256` con `sha256sum`.
+TTA_SEARCH
+1 para activar TTA en consultas, 0 para desactivarlo.
 
-- `make_portable_infierno.sh`  
-  Scripts/utilidades para parchar rutas, preparar versión portable, etc.
+QUANTIZATION
+none o scalar (cuantización INT8 en Qdrant para ahorrar RAM).
 
-- `export_github_zip.sh`  
-  Genera un ZIP listo para subir a GitHub, excluyendo datos pesados (`qdrant_storage`, `thumbs`, `logs`, etc.).
+Modo sin GPU (CPU)
 
----
+Si se ejecuta en una máquina sin GPU o sin drivers NVIDIA, es posible usar Oceano solo en CPU:
 
-## 10. Notas y limitaciones
+Ajustando embeddings.py para configurar InsightFace únicamente con CPUExecutionProvider.
 
-- Está pensado como **demo/lab** de búsqueda facial con Qdrant, no como producto final.
-- Asume **una persona principal por imagen** (se usa el rostro más grande).
-- No incluye gestión de usuarios/roles ni autenticación.
-- Los modelos de InsightFace **no están en el repo**:
-  - Se descargan automáticamente la primera vez bajo `/models`.
-  - Puedes precargar otros modelos en esa carpeta.
+Usando ctx_id=-1 en app.prepare().
 
----
+Esto reduce la velocidad de ingesta y búsqueda, pero mantiene la funcionalidad básica.
 
-## 11. Licencia
+Notas de privacidad y legales
 
-Añade aquí la licencia que prefieras (MIT, Apache 2.0, etc.).  
-Por ahora, trátalo como ejemplo educativo / demo de referencia.
+Oceano es un sistema de búsqueda facial genérico. El uso en entornos reales debe respetar:
+
+Legislación local sobre protección de datos personales y biometría.
+
+Políticas internas de la organización para:
+
+recolección de imágenes,
+
+almacenamiento de rostros,
+
+acceso a resultados y auditoría.
+
+Este repositorio no incluye ningún dataset real de personas ni modelos entrenados propietarios. Los modelos de InsightFace se descargan desde sus repositorios oficiales, sujetos a sus propias licencias.
